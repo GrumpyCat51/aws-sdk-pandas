@@ -219,7 +219,7 @@ def _validate_args(
     mode: Literal["append", "overwrite", "overwrite_partitions"],
     partition_cols: list[str] | None,
     merge_cols: list[str] | None,
-    merge_condition: Literal["update", "ignore"],
+    merge_condition: Literal["update", "update_only", "ignore"],
 ) -> None:
     if df.empty is True:
         raise exceptions.EmptyDataFrame("DataFrame cannot be empty.")
@@ -239,9 +239,9 @@ def _validate_args(
                 "When mode is 'overwrite_partitions' merge_cols must not be specified."
             )
 
-    if merge_cols and merge_condition not in ["update", "ignore"]:
+    if merge_cols and merge_condition not in ["update", "update_only", "ignore"]:
         raise exceptions.InvalidArgumentValue(
-            f"Invalid merge_condition: {merge_condition}. Valid values: ['update', 'ignore']"
+            f"Invalid merge_condition: {merge_condition}. Valid values: ['update', 'update_only', 'ignore']"
         )
 
 
@@ -251,7 +251,7 @@ def _merge_iceberg(
     table: str,
     source_table: str,
     merge_cols: list[str] | None = None,
-    merge_condition: Literal["update", "ignore"] = "update",
+    merge_condition: Literal["update", "update_only", "ignore"] = "update",
     merge_match_nulls: bool = False,
     kms_key: str | None = None,
     boto3_session: boto3.Session | None = None,
@@ -282,7 +282,7 @@ def _merge_iceberg(
 
         https://docs.aws.amazon.com/athena/latest/ug/merge-into-statement.html
     merge_condition: str, optional
-        The condition to be used in the MERGE INTO statement. Valid values: ['update', 'ignore'].
+        The condition to be used in the MERGE INTO statement. Valid values: ['update', 'update_only', 'ignore'].
     merge_match_nulls: bool, optional
         Instruct whether to have nulls in the merge condition match other nulls
     kms_key : str, optional
@@ -307,11 +307,19 @@ def _merge_iceberg(
 
     sql_statement: str
     if merge_cols:
-        if merge_condition == "update":
-            match_condition = f"""WHEN MATCHED THEN
+        if merge_condition in ("update", "update_only"):
+            matched_condition = f"""WHEN MATCHED THEN
                 UPDATE SET {', '.join([f'"{x}" = source."{x}"' for x in df.columns])}"""
         else:
-            match_condition = ""
+            matched_condition = ""
+
+        if merge_condition != "update_only":
+            not_matched_condition = f"""WHEN NOT MATCHED THEN
+                INSERT ({', '.join([f'"{x}"' for x in df.columns])})
+                VALUES ({', '.join([f'source."{x}"' for x in df.columns])})
+                """
+        else:
+            not_matched_condition = ""
 
         if merge_match_nulls:
             merge_conditions = [f'(target."{x}" IS NOT DISTINCT FROM source."{x}")' for x in merge_cols]
@@ -322,10 +330,8 @@ def _merge_iceberg(
             MERGE INTO "{database}"."{table}" target
             USING "{database}"."{source_table}" source
             ON {' AND '.join(merge_conditions)}
-            {match_condition}
-            WHEN NOT MATCHED THEN
-                INSERT ({', '.join([f'"{x}"' for x in df.columns])})
-                VALUES ({', '.join([f'source."{x}"' for x in df.columns])})
+            {matched_condition}
+            {not_matched_condition}
         """
     else:
         sql_statement = f"""
@@ -361,7 +367,7 @@ def to_iceberg(
     table_location: str | None = None,
     partition_cols: list[str] | None = None,
     merge_cols: list[str] | None = None,
-    merge_condition: Literal["update", "ignore"] = "update",
+    merge_condition: Literal["update", "update_only", "ignore"] = "update",
     merge_match_nulls: bool = False,
     keep_files: bool = True,
     data_source: str | None = None,
@@ -377,6 +383,7 @@ def to_iceberg(
     catalog_id: str | None = None,
     schema_evolution: bool = False,
     fill_missing_columns_in_df: bool = True,
+    update_subset_of_columns: bool = False,
     glue_table_settings: GlueTableSettings | None = None,
 ) -> None:
     """
@@ -410,7 +417,7 @@ def to_iceberg(
 
         https://docs.aws.amazon.com/athena/latest/ug/merge-into-statement.html
     merge_condition
-        The condition to be used in the MERGE INTO statement. Valid values: ['update', 'ignore'].
+        The condition to be used in the MERGE INTO statement. Valid values: ['update', 'update_only', 'ignore'].
     merge_match_nulls
         Instruct whether to have nulls in the merge condition match other nulls
     keep_files
@@ -524,7 +531,10 @@ def to_iceberg(
                 dtype=dtype,
                 columns_comments=glue_table_settings.get("columns_comments"),
             )
-        else:
+
+        # Schema evolution is not intended when only updating a subset of columns with
+        # newly updated data
+        elif merge_condition != "update_only" or schema_evolution:
             schema_differences, catalog_cols = _determine_differences(
                 df=df,
                 database=database,
