@@ -308,18 +308,18 @@ def _merge_iceberg(
     sql_statement: str
     if merge_cols:
         if merge_condition in ("update", "update_only"):
-            matched_condition = f"""WHEN MATCHED THEN
+            matched_update = f"""WHEN MATCHED THEN
                 UPDATE SET {', '.join([f'"{x}" = source."{x}"' for x in df.columns])}"""
         else:
-            matched_condition = ""
+            matched_update = ""
 
         if merge_condition != "update_only":
-            not_matched_condition = f"""WHEN NOT MATCHED THEN
+            not_matched_insert = f"""WHEN NOT MATCHED THEN
                 INSERT ({', '.join([f'"{x}"' for x in df.columns])})
                 VALUES ({', '.join([f'source."{x}"' for x in df.columns])})
                 """
         else:
-            not_matched_condition = ""
+            not_matched_insert = ""
 
         if merge_match_nulls:
             merge_conditions = [f'(target."{x}" IS NOT DISTINCT FROM source."{x}")' for x in merge_cols]
@@ -330,8 +330,8 @@ def _merge_iceberg(
             MERGE INTO "{database}"."{table}" target
             USING "{database}"."{source_table}" source
             ON {' AND '.join(merge_conditions)}
-            {matched_condition}
-            {not_matched_condition}
+            {matched_update}
+            {not_matched_insert}
         """
     else:
         sql_statement = f"""
